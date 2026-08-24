@@ -1,66 +1,92 @@
 # Gemini Watermark Remover
 
-A high-performance Python tool that completely removes the Gemini AI sparkle watermark from videos using **Precise Star Geometry Inpainting** and **FFmpeg**.
+A high-performance Python tool that completely removes the Gemini AI sparkle watermark from videos, frame image sequences, and standalone images using **Precise Geometric Star Inpainting** and **FFmpeg**.
 
 ---
 
-## 🚀 How It Works
+## 🚀 Key Features
 
-1. **Exact 4-Pointed Star Geometry:**
-   - Instead of generic square or astroid approximations, the model uses the **exact mathematical 4-pointed circular-arc geometry** of the Gemini logo.
-   - Applies a slight dilation (2px default) to guarantee 100% coverage of the anti-aliased perimeter, completely eliminating outline rings and boundary artifacts.
-
-2. **Fast Marching / Navier-Stokes Inpainting:**
-   - Seamlessly propagates surrounding texture, lines, gradients, and lighting across the watermark area.
-   - Leaves zero outline or ghosting artifacts.
-
-3. **High-Speed Streaming:**
-   - Streams raw video frames through FFmpeg standard pipes directly in Python.
-   - Processes at **300–500+ FPS**.
-
-4. **Dynamic Resolution Scaling:**
-   - Probes resolution and computes exact bounding boxes for any video aspect ratio (720p, 1080p, 4K, 9:16 vertical shorts, etc.).
+1. **Folder / Image Sequence Processing:**
+   - Cleans all image frames within a directory in parallel using multi-threading.
+   - Outputs to another folder keeping the **exact same frame filenames** (ideal for VFX / render pipelines / animation frame sequences).
+2. **Exact 4-Pointed Star Geometry Inpainting:**
+   - Uses the **exact mathematical 4-pointed circular-arc geometry** of the Gemini logo.
+   - Built-in boundary dilation (2px default) to guarantee 100% anti-aliased edge coverage with zero outline rings or halo artifacts.
+3. **Seamless Texture Propagation (Telea / Navier-Stokes):**
+   - Seamlessly propagates surrounding texture, gradients, and lighting across the watermark area.
+4. **Blazing Fast Performance:**
+   - Multi-threaded frame processing for image sequences (hundreds of frames per second).
+   - High-speed raw video stream processing at **300–500+ FPS**.
+5. **Dynamic Resolution Scaling:**
+   - Automatically computes exact watermark coordinates and scale for any resolution and aspect ratio (720p, 1080p, 4K, 9:16 vertical shorts, etc.).
 
 ---
 
 ## 🛠️ Prerequisites
 
-- **FFmpeg & FFprobe**: Must be installed and available in your `PATH`.
+- **Python 3.8+**
+- **OpenCV & NumPy**:
+  ```bash
+  pip install opencv-python numpy
+  ```
+- **FFmpeg & FFprobe** *(required for video processing)*:
   - macOS: `brew install ffmpeg`
   - Ubuntu/Debian: `sudo apt install ffmpeg`
   - Windows: `winget install Gyan.FFmpeg`
-- **Python 3.8+**
-- **OpenCV & NumPy**: `pip install opencv-python numpy`
 
 ---
 
 ## 📖 Usage
 
-### 1. Basic Removal (Single Video)
+### 1. Process a Folder of Frame Images (Retaining Same Filenames)
+Point the script to a folder containing frame images (`.png`, `.jpg`, `.jpeg`, `.webp`, `.bmp`, `.tiff`). It outputs cleaned frames into another folder with identical filenames:
+
 ```bash
-python remove_gemini_watermark.py input.mp4
-# Cleaned video saved as: input_cleaned.mp4
+# Clean folder of frames into a custom output folder
+python remove_gemini_watermark.py ./frames_folder/ -o ./cleaned_frames/
+
+# Default output folder will be named '<folder_name>_cleaned'
+python remove_gemini_watermark.py ./frames_folder/
 ```
 
-### 2. Specify Custom Output File
+### 2. Process a Single Image Frame
 ```bash
+python remove_gemini_watermark.py frame_0001.png -o frame_cleaned.png
+```
+
+### 3. Process a Single Video
+```bash
+# Automatic output naming (input_cleaned.mp4)
+python remove_gemini_watermark.py input.mp4
+
+# Custom output file
 python remove_gemini_watermark.py input.mp4 -o clean_video.mp4
 ```
 
-### 3. Preview Removal on a Single Frame
-Generates a test frame with the watermark area marked and cleaned:
+### 4. Preview Removal on a Single Frame / Video
+Generates a test frame with the watermark area marked with a green box and cleaned:
 ```bash
 python remove_gemini_watermark.py input.mp4 --preview
+python remove_gemini_watermark.py frame.png --preview
 ```
 
-### 4. Batch Process an Entire Directory
+### 5. Batch Process Video Files in a Folder
 ```bash
 python remove_gemini_watermark.py ./videos/ --batch
 # Outputs saved to: ./videos/cleaned_videos/
 ```
 
-### 5. Advanced Options
-- `--dilation 2`: Adjust mask expansion in pixels (default: 2px, ensures no outline is left).
-- `--radius 3`: Inpainting neighborhood radius (default: 3).
-- `--method ns`: Use Navier-Stokes inpainting for high-frequency gradients.
-- `--crf 18`: H.264 quality factor (0-51, default: 18 for visually lossless output).
+---
+
+## ⚙️ Advanced CLI Options
+
+| Option | Default | Description |
+| :--- | :--- | :--- |
+| `-o`, `--output` | Auto | Output file or destination directory |
+| `--workers` | CPU count | Number of parallel worker threads for frame folder processing |
+| `--dilation` | `2` | Mask expansion in pixels (ensures no outline or halo is left) |
+| `--radius` | `3` | Inpainting neighborhood radius |
+| `--method` | `inpaint` | Inpainting method: `inpaint` (Telea) or `ns` (Navier-Stokes) |
+| `--crf` | `18` | H.264 CRF quality factor for video (0-51, lower is higher quality) |
+| `--preset` | `fast` | x264 video encoding preset (`ultrafast`, `fast`, `medium`, `slow`) |
+| `--x`, `--y`, `-W`, `-H` | Auto | Override watermark position and bounding box dimensions |

@@ -2,23 +2,26 @@
 """
 Gemini Watermark Remover
 ========================
-Removes the Gemini AI sparkle watermark from videos.
+Removes the Gemini AI sparkle watermark from videos and frame image sequences.
 
 Features:
   - Exact Geometric Star Masking: Uses the precise 4-pointed circular arc geometry of the Gemini logo.
   - Inpainting (Telea / Navier-Stokes): Seamlessly propagates surrounding texture and lines across the logo with zero boundary artifacts or outline rings.
-  - Translucent Inverse Alpha De-blending: Restores original pixel values underneath semi-transparent watermarks.
+  - Frame Sequence & Folder Processing: Inpaints entire folders of frame images in parallel, retaining exact frame filenames in the output directory.
+  - Single Image & Video Support: Cleans standalone images (PNG, JPG, WebP, etc.) and video files (MP4, MOV, MKV, etc.).
   - High-Speed Streaming: Processes raw video through FFmpeg pipes at 300-500+ FPS.
   - Dynamic Resolution Scaling: Probes resolution and computes exact bounding boxes for 720p, 1080p, 4K, vertical 9:16 Shorts, etc.
 
 Requirements:
-  - FFmpeg and FFprobe installed and available in PATH.
-  - Python 3.8+ with opencv-python and numpy (falls back to native FFmpeg delogo if unavailable).
+  - Python 3.8+ with opencv-python and numpy.
+  - FFmpeg and FFprobe (required for video processing).
 """
 
 import argparse
+import concurrent.futures
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -31,6 +34,15 @@ try:
     OPENCV_AVAILABLE = True
 except ImportError:
     OPENCV_AVAILABLE = False
+
+
+IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tiff", ".tif"}
+VIDEO_EXTENSIONS = {".mp4", ".mov", ".mkv", ".webm", ".avi", ".m4v"}
+
+
+def natural_sort_key(s: str):
+    """Sort strings containing numbers in human-natural order."""
+    return [int(text) if text.isdigit() else text.lower() for text in re.split(r"(\d+)", s)]
 
 
 def check_ffmpeg() -> bool:
@@ -78,7 +90,7 @@ def get_video_info(input_path: str) -> dict:
 def calculate_watermark_box(width: int, height: int) -> tuple[int, int, int, int]:
     """
     Calculate (x, y, w, h) bounding box for the Gemini sparkle watermark
-    proportional to the video resolution.
+    proportional to the resolution.
 
     Baseline on 1280x720 (16:9):
       - Center is at x=1160 (120px from right edge), y=600 (120px from bottom edge).
@@ -136,6 +148,178 @@ def generate_gemini_star_mask(box_w: int, box_h: int, dilation: int = 2) -> np.n
     return star
 
 
+def remove_watermark_image(
+    input_file: str,
+    output_file: str,
+    x: int = None,
+    y: int = None,
+    w: int = None,
+    h: int = None,
+    method: str = "inpaint",
+    dilation: int = 2,
+    inpaint_radius: int = 3,
+    preview_only: bool = False,
+) -> bool:
+    """
+    Cleans watermark from a single image frame using exact geometric star inpainting.
+    Supports RGBA and RGB image formats.
+    """
+    if not OPENCV_AVAILABLE:
+        print("[ERROR] OpenCV ('opencv-python') is required for image frame processing.")
+        return False
+
+    img = cv2.imread(str(input_file), cv2.IMREAD_UNCHANGED)
+    if img is None:
+        print(f"[ERROR] Could not read image '{input_file}'.")
+        return False
+
+    # Handle grayscale, RGB, and RGBA
+    has_alpha = len(img.shape) == 3 and img.shape[2] == 4
+    if has_alpha:
+        bgr = img[:, :, :3]
+        alpha = img[:, :, 3]
+    elif len(img.shape) == 2:
+        bgr = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+        alpha = None
+    else:
+        bgr = img
+        alpha = None
+
+    height, width = bgr.shape[:2]
+
+    auto_x, auto_y, auto_w, auto_h = calculate_watermark_box(width, height)
+    final_x = x if x is not None else auto_x
+    final_y = y if y is not None else auto_y
+    final_w = w if w is not None else auto_w
+    final_h = h if h is not None else auto_h
+
+    # Generate exact star mask and inpaint local crop
+    mask = generate_gemini_star_mask(final_w, final_h, dilation=dilation)
+    inpaint_flag = cv2.INPAINT_NS if method == "ns" else cv2.INPAINT_TELEA
+
+    crop = bgr[final_y:final_y + final_h, final_x:final_x + final_w]
+    inpainted = cv2.inpaint(crop, mask, inpaintRadius=inpaint_radius, flags=inpaint_flag)
+    bgr[final_y:final_y + final_h, final_x:final_x + final_w] = inpainted
+
+    if preview_only:
+        cv2.rectangle(
+            bgr,
+            (final_x, final_y),
+            (final_x + final_w, final_y + final_h),
+            (0, 255, 0),
+            2,
+        )
+
+    # Reconstruct final image
+    if has_alpha:
+        out_img = cv2.merge([bgr[:, :, 0], bgr[:, :, 1], bgr[:, :, 2], alpha])
+    else:
+        out_img = bgr
+
+    # Ensure output parent directory exists
+    out_path = Path(output_file)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    cv2.imwrite(str(out_path), out_img)
+    return True
+
+
+def process_image_folder(
+    input_dir: Path,
+    output_dir: Path,
+    x: int = None,
+    y: int = None,
+    w: int = None,
+    h: int = None,
+    method: str = "inpaint",
+    dilation: int = 2,
+    inpaint_radius: int = 3,
+    preview_only: bool = False,
+    workers: int = None,
+) -> bool:
+    """
+    Processes all frame images within a directory in parallel.
+    Outputs cleaned frames into output_dir with identical filenames.
+    """
+    image_files = [
+        f for f in input_dir.iterdir()
+        if f.is_file() and f.suffix.lower() in IMAGE_EXTENSIONS
+    ]
+
+    if not image_files:
+        print(f"[WARNING] No image frames found in directory '{input_dir}'.")
+        return False
+
+    # Sort frames naturally (e.g. frame_1.png, frame_2.png, frame_10.png)
+    image_files.sort(key=lambda f: natural_sort_key(f.name))
+    total_frames = len(image_files)
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    print(f"[INFO] Found {total_frames} frame(s) in '{input_dir}'")
+    print(f"[INFO] Output folder: '{output_dir}' (retaining exact filenames)")
+    print(f"[INFO] Inpainting method: {method} (dilation={dilation}px, radius={inpaint_radius}px)...")
+
+    max_workers = workers or min(os.cpu_count() or 4, 16)
+    print(f"[INFO] Processing using {max_workers} worker threads...")
+
+    t0 = time.time()
+    completed_count = 0
+    errors = 0
+
+    def process_single(frame_path: Path):
+        # Output frame retains the exact same name
+        target_path = output_dir / frame_path.name
+        ok = remove_watermark_image(
+            input_file=str(frame_path),
+            output_file=str(target_path),
+            x=x,
+            y=y,
+            w=w,
+            h=h,
+            method=method,
+            dilation=dilation,
+            inpaint_radius=inpaint_radius,
+            preview_only=preview_only,
+        )
+        return ok
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_to_file = {executor.submit(process_single, f): f for f in image_files}
+
+        for future in concurrent.futures.as_completed(future_to_file):
+            frame_file = future_to_file[future]
+            try:
+                success = future.result()
+                if success:
+                    completed_count += 1
+                else:
+                    errors += 1
+                    print(f"[ERROR] Failed processing '{frame_file.name}'")
+            except Exception as exc:
+                errors += 1
+                print(f"[ERROR] Exception on '{frame_file.name}': {exc}")
+
+            # Dynamic progress output
+            progress = (completed_count + errors) / total_frames * 100
+            elapsed = time.time() - t0
+            fps_speed = (completed_count + errors) / elapsed if elapsed > 0 else 0
+            sys.stdout.write(
+                f"\r[PROGRESS] {completed_count + errors}/{total_frames} frames ({progress:.1f}%) "
+                f"- {fps_speed:.1f} fps - Elapsed: {elapsed:.1f}s"
+            )
+            sys.stdout.flush()
+
+    sys.stdout.write("\n")
+    total_time = time.time() - t0
+    avg_fps = total_frames / total_time if total_time > 0 else 0
+
+    print(f"[SUCCESS] Finished {completed_count}/{total_frames} frames in {total_time:.2f}s ({avg_fps:.1f} fps).")
+    if errors > 0:
+        print(f"[WARNING] {errors} frame(s) encountered errors.")
+    print(f"[SUCCESS] All frames saved to: {output_dir}")
+    return errors == 0
+
+
 def remove_watermark_inpaint(
     input_file: str,
     output_file: str,
@@ -153,7 +337,7 @@ def remove_watermark_inpaint(
     use_ns: bool = False,
 ) -> bool:
     """
-    Removes the watermark using OpenCV Fast Marching (Telea) or Navier-Stokes inpainting
+    Removes the watermark from video using OpenCV Fast Marching (Telea) or Navier-Stokes inpainting
     on the exact dilated star mask. Streams raw frames through FFmpeg for extreme speed.
     """
     mask = generate_gemini_star_mask(w, h, dilation=dilation)
@@ -201,11 +385,11 @@ def remove_watermark_inpaint(
                 break
 
             frame = np.frombuffer(raw, dtype=np.uint8).reshape(height, width, 3).copy()
-            crop = frame[y:y+h, x:x+w]
+            crop = frame[y:y + h, x:x + w]
 
             # Inpaint only the local crop for maximum performance
             inpainted = cv2.inpaint(crop, mask, inpaintRadius=inpaint_radius, flags=inpaint_flag)
-            frame[y:y+h, x:x+w] = inpainted
+            frame[y:y + h, x:x + w] = inpainted
 
             out_proc.stdin.write(frame.tobytes())
             frame_count += 1
@@ -287,7 +471,7 @@ def remove_watermark(
     preview_only: bool = False,
     preview_frame_sec: float = 2.0,
 ) -> bool:
-    """Main removal coordinator function."""
+    """Main removal coordinator function for video files."""
     if not os.path.isfile(input_file):
         print(f"[ERROR] Input video '{input_file}' not found.")
         return False
@@ -327,8 +511,8 @@ def remove_watermark(
             frame = np.frombuffer(raw, dtype=np.uint8).reshape(height, width, 3).copy()
 
             mask = generate_gemini_star_mask(final_w, final_h, dilation=dilation)
-            crop = frame[final_y:final_y+final_h, final_x:final_x+final_w]
-            frame[final_y:final_y+final_h, final_x:final_x+final_w] = cv2.inpaint(
+            crop = frame[final_y:final_y + final_h, final_x:final_x + final_w]
+            frame[final_y:final_y + final_h, final_x:final_x + final_w] = cv2.inpaint(
                 crop, mask, inpaintRadius=inpaint_radius, flags=cv2.INPAINT_TELEA
             )
 
@@ -399,27 +583,38 @@ def remove_watermark(
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Remove Gemini watermark from video without any outline artifacts.",
+        description="Remove Gemini watermark from videos, frame image folders, and single images.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""Methods:
   inpaint (default) : Uses OpenCV Telea inpainting on the exact dilated 4-pointed Gemini star geometry (zero outline).
   ns                : Uses Navier-Stokes inpainting for high-gradient backgrounds.
-  delogo            : Uses FFmpeg native spatial interpolation.
-  blur              : Applies localized blur overlay.
+  delogo            : Uses FFmpeg native spatial interpolation (videos only).
+  blur              : Applies localized blur overlay (videos only).
 
 Examples:
-  python remove_gemini_watermark.py input.mp4
+  # Folder of multiple frames -> Output to another folder with identical frame filenames:
+  python remove_gemini_watermark.py ./frames_folder/ -o ./cleaned_frames/
+  python remove_gemini_watermark.py ./frames_folder/
+
+  # Single frame image:
+  python remove_gemini_watermark.py frame.png -o frame_cleaned.png
+
+  # Single video file:
   python remove_gemini_watermark.py input.mp4 -o clean_output.mp4
+
+  # Single video preview:
   python remove_gemini_watermark.py input.mp4 --preview
+
+  # Batch process video files in a folder:
   python remove_gemini_watermark.py ./videos_folder/ --batch
 """,
     )
 
-    parser.add_argument("input", help="Path to input video file or folder (with --batch)")
-    parser.add_argument("-o", "--output", help="Path to output video file or output directory")
-    parser.add_argument("--batch", action="store_true", help="Batch process all videos in the input directory")
+    parser.add_argument("input", help="Path to input video file, image frame, or folder of frames/videos")
+    parser.add_argument("-o", "--output", help="Path to output video/image file or destination folder")
+    parser.add_argument("--batch", action="store_true", help="Batch process all videos/frames in the input directory")
     parser.add_argument("--preview", action="store_true", help="Generate a preview image with the watermark removed and box marked")
-    parser.add_argument("--preview-time", type=float, default=2.0, help="Timestamp (seconds) for preview frame (default: 2.0)")
+    parser.add_argument("--preview-time", type=float, default=2.0, help="Timestamp (seconds) for preview frame in video (default: 2.0)")
     parser.add_argument(
         "--method",
         choices=["inpaint", "ns", "delogo", "blur"],
@@ -428,8 +623,9 @@ Examples:
     )
     parser.add_argument("--dilation", type=int, default=2, help="Mask boundary dilation in pixels to fully eliminate outlines (default: 2)")
     parser.add_argument("--radius", type=int, default=3, help="Inpainting neighborhood radius (default: 3)")
-    parser.add_argument("--crf", type=int, default=18, help="H.264 CRF quality factor 0-51 (lower is better, default: 18)")
+    parser.add_argument("--crf", type=int, default=18, help="H.264 CRF quality factor 0-51 for video encoding (lower is better, default: 18)")
     parser.add_argument("--preset", default="fast", help="x264 encoding preset: ultrafast, fast, medium, slow (default: fast)")
+    parser.add_argument("--workers", type=int, help="Number of concurrent worker threads for processing frame folders")
     parser.add_argument("--x", type=int, help="Override watermark X coordinate")
     parser.add_argument("--y", type=int, help="Override watermark Y coordinate")
     parser.add_argument("--width", "-W", type=int, dest="w", help="Override watermark width")
@@ -437,34 +633,23 @@ Examples:
 
     args = parser.parse_args()
 
-    if not check_ffmpeg():
-        sys.exit(1)
-
     input_path = Path(args.input)
 
-    # Batch processing
-    if args.batch or input_path.is_dir():
-        if not input_path.is_dir():
-            print(f"[ERROR] '{args.input}' is not a directory.")
-            sys.exit(1)
+    if not input_path.exists():
+        print(f"[ERROR] Input path '{args.input}' does not exist.")
+        sys.exit(1)
 
-        output_dir = Path(args.output) if args.output else input_path / "cleaned_videos"
-        output_dir.mkdir(parents=True, exist_ok=True)
+    # 1. DIRECTORY PROCESSING (Folder of frames or folder of videos)
+    if input_path.is_dir():
+        image_files = [f for f in input_path.iterdir() if f.is_file() and f.suffix.lower() in IMAGE_EXTENSIONS]
+        video_files = [f for f in input_path.iterdir() if f.is_file() and f.suffix.lower() in VIDEO_EXTENSIONS]
 
-        video_extensions = {".mp4", ".mov", ".mkv", ".webm", ".avi", ".m4v"}
-        video_files = [f for f in input_path.iterdir() if f.suffix.lower() in video_extensions]
-
-        if not video_files:
-            print(f"[WARNING] No video files found in '{args.input}'.")
-            sys.exit(0)
-
-        print(f"[INFO] Found {len(video_files)} video(s) to process.")
-        for idx, vid in enumerate(video_files, 1):
-            out_file = output_dir / f"{vid.stem}_cleaned{vid.suffix}"
-            print(f"\n[{idx}/{len(video_files)}] Processing {vid.name}...")
-            remove_watermark(
-                input_file=str(vid),
-                output_file=str(out_file),
+        # Case A: Folder contains image frames
+        if image_files and not (args.batch and video_files and not image_files):
+            output_dir = Path(args.output) if args.output else input_path.parent / f"{input_path.name}_cleaned"
+            ok = process_image_folder(
+                input_dir=input_path,
+                output_dir=output_dir,
                 x=args.x,
                 y=args.y,
                 w=args.w,
@@ -472,24 +657,84 @@ Examples:
                 method=args.method,
                 dilation=args.dilation,
                 inpaint_radius=args.radius,
-                crf=args.crf,
-                preset=args.preset,
                 preview_only=args.preview,
-                preview_frame_sec=args.preview_time,
+                workers=args.workers,
             )
-        print(f"\n[DONE] Batch processing complete! Output saved to: {output_dir}")
+            if not ok:
+                sys.exit(1)
+            return
+
+        # Case B: Folder contains video files
+        if video_files:
+            if not check_ffmpeg():
+                sys.exit(1)
+
+            output_dir = Path(args.output) if args.output else input_path / "cleaned_videos"
+            output_dir.mkdir(parents=True, exist_ok=True)
+
+            print(f"[INFO] Found {len(video_files)} video(s) in '{input_path}'.")
+            for idx, vid in enumerate(video_files, 1):
+                out_file = output_dir / f"{vid.stem}_cleaned{vid.suffix}"
+                print(f"\n[{idx}/{len(video_files)}] Processing {vid.name}...")
+                remove_watermark(
+                    input_file=str(vid),
+                    output_file=str(out_file),
+                    x=args.x,
+                    y=args.y,
+                    w=args.w,
+                    h=args.h,
+                    method=args.method,
+                    dilation=args.dilation,
+                    inpaint_radius=args.radius,
+                    crf=args.crf,
+                    preset=args.preset,
+                    preview_only=args.preview,
+                    preview_frame_sec=args.preview_time,
+                )
+            print(f"\n[DONE] Video batch processing complete! Output saved to: {output_dir}")
+            return
+
+        print(f"[WARNING] No supported image frames or video files found in directory '{args.input}'.")
+        sys.exit(0)
+
+    # 2. SINGLE FILE PROCESSING (Single image frame or single video file)
+    suffix = input_path.suffix.lower()
+
+    # Case A: Single Image file
+    if suffix in IMAGE_EXTENSIONS:
+        if args.output:
+            out_path = args.output
+        else:
+            out_path = str(input_path.parent / f"{input_path.stem}_cleaned{suffix}")
+
+        print(f"[INFO] Processing single image frame: '{input_path}' -> '{out_path}'")
+        ok = remove_watermark_image(
+            input_file=str(input_path),
+            output_file=out_path,
+            x=args.x,
+            y=args.y,
+            w=args.w,
+            h=args.h,
+            method=args.method,
+            dilation=args.dilation,
+            inpaint_radius=args.radius,
+            preview_only=args.preview,
+        )
+        if ok:
+            print(f"[SUCCESS] Cleaned image saved to: {out_path}")
+        else:
+            sys.exit(1)
         return
 
-    # Single file mode
-    if not input_path.is_file():
-        print(f"[ERROR] File '{args.input}' does not exist.")
+    # Case B: Video file
+    if not check_ffmpeg():
         sys.exit(1)
 
     if args.output:
         out_path = args.output
     else:
-        suffix = ".png" if args.preview else input_path.suffix
-        out_path = str(input_path.parent / f"{input_path.stem}_cleaned{suffix}")
+        out_suffix = ".png" if args.preview else input_path.suffix
+        out_path = str(input_path.parent / f"{input_path.stem}_cleaned{out_suffix}")
 
     success = remove_watermark(
         input_file=str(input_path),
