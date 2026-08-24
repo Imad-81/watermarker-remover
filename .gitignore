@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# Media / videos
+*.mp4
+*.mov
+*.mkv
+*.webm
+*.avi
+*.m4v
+*_cleaned.png
+cleaned_videos/
+
+# Editor / OS
+.DS_Store
+.vscode/
+.idea/
